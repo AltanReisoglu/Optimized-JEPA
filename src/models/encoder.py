@@ -197,13 +197,14 @@ def train_vljepa(model, dataloader, optimizer, device='cuda'):
         video_paths = batch['video_path']
         queries = batch['query']
         targets = batch['target']
+        optimizer.zero_grad()
         pred_emb, target_emb = model(video_paths, queries, targets)
         loss = bidirectional_infonce_loss(
             pred_emb, 
             target_emb, 
             temperature=model.config.temperature
         )
-        optimizer.zero_grad()
+        
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
