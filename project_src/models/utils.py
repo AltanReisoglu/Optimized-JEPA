@@ -347,9 +347,6 @@ class BidirectionalAntiAttention(nn.Module):
         return h_mixed
 
 
-# Backward compatibility alias
-AntiAttention = BidirectionalAntiAttention
-
 
 class FFN(nn.Module):
 
@@ -370,7 +367,7 @@ class ResidualBlock(nn.Module):
     def __init__(self, dimension,reduction,coeffs):
         super().__init__()
         self.ffn = FFN(dimension,4)
-        self.antia = AntiAttention(r=reduction, d=dimension, window_offsets=coeffs)
+        self.antia = B(r=reduction, d=dimension, window_offsets=coeffs)
         self.layer_norm = RMSNorm(dimension)
         self.dropout = nn.Dropout(0.1)
         
