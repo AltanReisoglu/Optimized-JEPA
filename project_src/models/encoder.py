@@ -133,10 +133,16 @@ class VLJEPA(nn.Module):
             frames = vr.get_batch(indices).asnumpy()
             
             # Convert to tensor: (T, H, W, C) -> (T, C, H, W)
-            frames_tensor = torch.from_numpy(frames).float().permute(0, 3, 1, 2)
+            # Normalize to [0, 1] range
+            frames_tensor = torch.from_numpy(frames).float() / 255.0
+            frames_tensor = frames_tensor.permute(0, 3, 1, 2)
             
             # Process with V-JEPA preprocessor
-            processed = self.processor(frames_tensor)
+            # Ensure input is (C, T, H, W) for standard transforms if needed, 
+            # though VJEPA preprocessor usually handles (T, C, H, W) or (C, T, H, W).
+            # We'll stick to what we fixed in train.py for consistency: input as (C, T, H, W)
+            frames_input = frames_tensor.permute(1, 0, 2, 3) 
+            processed = self.processor(frames_input)
             
             # Handle different return types
             if isinstance(processed, list):
@@ -213,21 +219,30 @@ class VLJEPA(nn.Module):
         
         # Convert to 4D causal mask format
         # Shape: (B, 1, seq_len, seq_len)
-        attention_mask = torch.zeros(B, 1, seq_length, seq_length, device=device, dtype=predictor_dtype)
         
-        # Allow attention where both tokens are valid
-        for i in range(seq_length):
-            for j in range(seq_length):
-                if mask_1d[:, i].any() and mask_1d[:, j].any():
-                    attention_mask[:, :, i, j] = 0  # 0 means attend
-                else:
-                    attention_mask[:, :, i, j] = float('-inf')  # -inf means mask out
+        # Vectorized Attention Mask Creation (REPLACES SLOW LOOPS)
+        # mask_1d: (B, seq_len)
+        # We want to allow attention only if BOTH position i and j are valid (1)
         
-        # Simplified: just mask out padding positions
-        # Create mask where padding tokens cannot be attended to
-        attention_mask = torch.zeros(B, 1, seq_length, seq_length, device=device, dtype=predictor_dtype)
-        mask_expanded = mask_1d.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, seq_len)
-        attention_mask = attention_mask.masked_fill(~mask_expanded, float('-inf'))
+        # Expand for broadcasting:
+        # (B, 1, seq_len, 1)
+        mask_rows = mask_1d.unsqueeze(1).unsqueeze(3) 
+        # (B, 1, 1, seq_len)
+        mask_cols = mask_1d.unsqueeze(1).unsqueeze(2)
+        
+        # Logical AND: Both must be valid to attend
+        # Result: (B, 1, seq_len, seq_len)
+        attention_allowed = mask_rows & mask_cols
+        
+        # Create mask tensor initialized to -inf
+        attention_mask = torch.full((B, 1, seq_length, seq_length), float('-inf'), device=device, dtype=predictor_dtype)
+        
+        # Fill valid positions with 0.0
+        attention_mask = attention_mask.masked_fill(attention_allowed, 0.0)
+        
+        # -----------------------------------------------------------------------
+        # OLD SLOW CODE REMOVED (Nested loops caused the freeze)
+        # -----------------------------------------------------------------------
         
         hidden_states = combined
         

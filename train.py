@@ -28,26 +28,55 @@ try:
 except ImportError:
     print("Warning: 'datasets' library not available. Install with: pip install datasets")
     DATASETS_AVAILABLE = False
+import subprocess
+import os
 
-
-class MSRVTTVLM2VecDataset(Dataset):
+def download_youtube_video(url: str, output_path: str) -> bool:
     """
-    Dataset for MSR-VTT with VLM2Vec format
+    Download YouTube video as mp4.
+    Returns True if successful.
+    """
+    try:
+        cmd = [
+            "yt-dlp",
+            "-f", "mp4",
+            "-o", output_path,
+            url
+        ]
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True
+        )
+        return os.path.exists(output_path)
+    except Exception:
+        return False
+
+
+class LocalVideoDataset(Dataset):
+    """
+    Dataset for local videos in assets folder
     """
     def __init__(
         self, 
-        hf_dataset, 
         config: VLJEPAConfig, 
         video_root: str = "assets",
         max_samples: Optional[int] = None
     ):
-        self.ds = hf_dataset
         self.config = config
         self.video_root = video_root
         
+        # Get all video files
+        self.video_files = []
+        if os.path.exists(video_root):
+            for file in os.listdir(video_root):
+                if file.endswith('.mp4'):
+                    self.video_files.append(file)
+        
         # Limit dataset size if specified
         if max_samples is not None:
-            self.ds = self.ds.select(range(min(max_samples, len(self.ds))))
+            self.video_files = self.video_files[:max_samples]
         
         # Processor for V-JEPA
         print("Loading V-JEPA preprocessor...")
@@ -66,12 +95,12 @@ class MSRVTTVLM2VecDataset(Dataset):
         # Track failed videos
         self.failed_videos = set()
         
-        print(f"Dataset initialized with {len(self.ds)} samples")
+        print(f"Dataset initialized with {len(self.video_files)} video files")
 
     def __len__(self):
-        return len(self.ds)
+        return len(self.video_files)
 
-    def process_video(self, video_path: str, start_time: float = 0.0, end_time: float = 10.0) -> Optional[torch.Tensor]:
+    def process_video(self, video_path: str, start_time: float = 0.0, end_time: float = 8.0) -> Optional[torch.Tensor]:
         """
         Process video file and return tensor
         
@@ -103,7 +132,6 @@ class MSRVTTVLM2VecDataset(Dataset):
             # Sample frames uniformly
             num_frames = self.config.VIDEO_INPUT_FRAMES
             if end_frame - start_frame < num_frames:
-                # Not enough frames, use all available
                 indices = np.linspace(0, total_frames - 1, num_frames).astype(int)
             else:
                 indices = np.linspace(start_frame, end_frame, num_frames).astype(int)
@@ -112,18 +140,23 @@ class MSRVTTVLM2VecDataset(Dataset):
             frames = vr.get_batch(indices).asnumpy()
             
             # frames: (T, H, W, C) -> (T, C, H, W)
-            frames_tensor = torch.from_numpy(frames).float().permute(0, 3, 1, 2)
+            # Normalize to [0, 1] IMMEDIATELY. This was missing!
+            frames_tensor = torch.from_numpy(frames).float() / 255.0
+            frames_tensor = frames_tensor.permute(0, 3, 1, 2)  # (T, C, H, W)
             
             # Process with V-JEPA preprocessor if available
+            # Note: Preprocessors often handle normalization, but feeding 0-255 usually breaks them if they expect 0-1.
+            # We provide 0-1 float tensor now.
             if self.processor:
                 try:
-                    processed = self.processor(frames_tensor)
+                    # Some processors expect (C, T, H, W) -> permute
+                    frames_input = frames_tensor.permute(1, 0, 2, 3) # (C, T, H, W)
+                    processed = self.processor(frames_input)
                     
                     # Handle different return types
                     if isinstance(processed, list): 
                         processed = processed[0]
                     elif isinstance(processed, dict):
-                        # Try common keys
                         if 'x' in processed:
                             processed = processed['x']
                         else:
@@ -132,20 +165,21 @@ class MSRVTTVLM2VecDataset(Dataset):
                     return processed
                 except Exception as e:
                     if video_path not in self.failed_videos:
-                        print(f"⚠️  Processor failed for {video_path}: {e}")
-                        self.failed_videos.add(video_path)
-                    return None
-            
+                        print(f"⚠️  Processor failed for {video_path} (falling back to manual): {e}")
+                        # Don't add to failed_videos, fall through to manual
+                    
             # Fallback: basic normalization
-            # Expected format: (3, T, H, W)
-            frames_tensor = frames_tensor.permute(1, 0, 2, 3)  # (T, C, H, W) -> (C, T, H, W)
+            # Ensure shape is (C, T, H, W)
+            if frames_tensor.shape[1] == 3: # if (T, C, H, W)
+                frames_tensor = frames_tensor.permute(1, 0, 2, 3)
+                
             frames_tensor = F.interpolate(
                 frames_tensor, 
                 size=(self.config.VIDEO_INPUT_SIZE[0], self.config.VIDEO_INPUT_SIZE[1]),
                 mode='bilinear',
                 align_corners=False
             )
-            frames_tensor = frames_tensor / 255.0  # Normalize to [0, 1]
+            # Already normalized to [0, 1] above
             
             return frames_tensor
             
@@ -156,42 +190,55 @@ class MSRVTTVLM2VecDataset(Dataset):
             return None
 
     def __getitem__(self, idx: int) -> Dict:
-        item = self.ds[idx]
+        video_file = self.video_files[idx]
+        video_path = os.path.join(self.video_root, video_file)
+        video_id = video_file.replace('.mp4', '')
         
-        # Resolve video path from dataset
-        video_path = item['url']
-        start_time = item.get("start time", 0.0)
-        end_time = item.get("end time", 10.0)
-        caption = item.get("caption", "")
+        # --- CAPTION LOADING LOGIC ---
+        # Try to find a corresponding text file
+        caption_path = os.path.join(self.video_root, video_file.replace('.mp4', '.txt'))
+        caption = ""
         
-        # Process video
-        pixel_values = self.process_video(video_path, start_time, end_time)
+        if os.path.exists(caption_path):
+            try:
+                with open(caption_path, 'r', encoding='utf-8') as f:
+                    caption = f.read().strip()
+            except Exception:
+                pass
         
-        # Fallback to dummy tensor if video processing failed
+        # Fallback: Use filename as caption if no text file (better than empty)
+        if not caption:
+            # Clean up filename to make it a readable caption
+            clean_name = video_id.replace('_', ' ').replace('-', ' ')
+            caption = f"Video of {clean_name}"
+
+        # --- PROCESS VIDEO ---
+        pixel_values = self.process_video(video_path, start_time=0.0, end_time=8.0)
+
         if pixel_values is None:
             pixel_values = torch.zeros(
-                3, 
-                self.config.VIDEO_INPUT_FRAMES, 
-                self.config.VIDEO_INPUT_SIZE[0], 
+                3,
+                self.config.VIDEO_INPUT_FRAMES,
+                self.config.VIDEO_INPUT_SIZE[0],
                 self.config.VIDEO_INPUT_SIZE[1]
             )
-        
-        # Tokenize query
+
+        # --- TOKENIZE QUERY ---
         prompt = "What is the topic of this video?"
         tokens = self.tokenizer(
             prompt,
             max_length=self.config.max_query_length,
-            padding='max_length',
+            padding="max_length",
             truncation=True,
-            return_tensors='pt'
+            return_tensors="pt"
         )
-        
+
         return {
             "pixel_values": pixel_values,
-            "input_ids": tokens['input_ids'].squeeze(0),
-            "attention_mask": tokens['attention_mask'].squeeze(0),
+            "input_ids": tokens["input_ids"].squeeze(0),
+            "attention_mask": tokens["attention_mask"].squeeze(0),
             "caption": caption,
-            "video_path": video_path  # For debugging
+            "video_id": video_id
         }
 
 
@@ -463,47 +510,18 @@ def main():
         device = 'cuda'
         print(f"✓ Using GPU: {torch.cuda.get_device_name(0)}")
     
-    # Load dataset
-    if not DATASETS_AVAILABLE:
-        print("❌ Cannot load dataset - 'datasets' library not available")
-        return
-    
-    print("\nLoading dataset...")
+    # Load dataset from local videos
+    print("\nLoading local video dataset...")
     try:
-        ds = load_dataset("VLM2Vec/MSR-VTT", "test_1k", split="test[0:100]")
-        print(f"✓ Dataset loaded: {len(ds)} samples")
+        dataset = LocalVideoDataset(
+            config=config,
+            video_root=args.video_root,
+            max_samples=args.max_samples
+        )
+        print(f"✓ Dataset loaded: {len(dataset)} video files")
     except Exception as e:
         print(f"❌ Failed to load dataset: {e}")
         return
-    
-    # Create config and dataset
-    config = VLJEPAConfig()
-    
-    # Apply learning rate arguments
-    config.learning_rate = args.learning_rate
-    config.y_encoder_lr_multiplier = args.y_encoder_lr_multiplier
-    
-    # Override individual LRs if specified
-    if args.vision_lr is not None:
-        config.vision_proj_lr = args.vision_lr
-    if args.predictor_lr is not None:
-        config.predictor_lr = args.predictor_lr
-    if args.y_encoder_lr is not None:
-        config.y_encoder_lr = args.y_encoder_lr
-    
-    print(f"\n📊 Learning Rate Configuration:")
-    print(f"  Base LR: {config.learning_rate:.2e}")
-    print(f"  Vision Proj LR: {config.get_vision_proj_lr():.2e}")
-    print(f"  Predictor LR: {config.get_predictor_lr():.2e}")
-    print(f"  Y-Encoder LR: {config.get_y_encoder_lr():.2e}")
-    print(f"  Y-Encoder Multiplier: {config.y_encoder_lr_multiplier}")
-    
-    dataset = MSRVTTVLM2VecDataset(
-        hf_dataset=ds,
-        config=config,
-        video_root=args.video_root,
-        max_samples=args.max_samples
-    )
     
     dataloader = DataLoader(
         dataset, 
@@ -564,12 +582,9 @@ if __name__ == "__main__":
             print("❌ 'datasets' library required. Install with: pip install datasets")
             sys.exit(1)
         
-        # Load small dataset
-        print("Loading dataset...")
-        ds = load_dataset("VLM2Vec/MSR-VTT", "test_1k", split="test[0:10]")
-        
-        dataset = MSRVTTVLM2VecDataset(
-            hf_dataset=ds,
+        # Load small dataset from local videos
+        print("Loading local video dataset...")
+        dataset = LocalVideoDataset(
             config=config,
             video_root=r"C:\Users\bahaa\Desktop\Optimized-JEPA\assets",
             max_samples=5
